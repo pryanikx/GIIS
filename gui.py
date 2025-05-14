@@ -348,7 +348,18 @@ class GraphicEditor:
             elif shape in ["Delaunay", "Voronoi"]:
                 points = self.get_polygon_points(self.entry_points)
                 if points and len(points) >= 3:
-                    self.voronoi_delaunay.draw(points, cell_size, self.ax, mode=shape.lower())
+                    unique_points = []
+                    seen = set()
+                    for x, y in points:
+                        if (x, y) not in seen and 0 <= x <= 100 and 0 <= y <= 100:
+                            unique_points.append((x, y))
+                            seen.add((x, y))
+                        else:
+                            messagebox.showwarning("Предупреждение", f"Пропущена точка ({x}, {y}): вне области или дубликат")
+                    if len(unique_points) < 3:
+                        messagebox.showerror("Ошибка", "Нужно минимум 3 уникальные точки в области [0, 100]")
+                        return
+                    asyncio.run(self.voronoi_delaunay.draw(unique_points, cell_size, self.ax, mode=shape.lower()))
                 else:
                     messagebox.showerror("Ошибка", "Нужно минимум 3 точки")
             self.canvas.draw()
@@ -419,6 +430,26 @@ class GraphicEditor:
                     return
                 asyncio.run(self.polygon_editor.draw_polygon(points, segment_points, cell_size, self.ax,
                                                             mode=mode, fill_color=self.fill_color_var.get(), debug=True))
+            elif shape in ["Delaunay", "Voronoi"]:
+                points = self.get_polygon_points(self.entry_points)
+                if points and len(points) >= 3:
+                    unique_points = []
+                    seen = set()
+                    for x, y in points:
+                        if (x, y) not in seen and 0 <= x <= 100 and 0 <= y <= 100:
+                            unique_points.append((x, y))
+                            seen.add((x, y))
+                        else:
+                            messagebox.showwarning("Предупреждение", f"Пропущена точка ({x}, {y}): вне области или дубликат")
+                    if len(unique_points) < 3:
+                        messagebox.showerror("Ошибка", "Нужно минимум 3 уникальные точки в области [0, 100]")
+                        return
+                    try:
+                        asyncio.run(self.voronoi_delaunay.draw(unique_points, cell_size, self.ax, mode=shape.lower(), debug=True))
+                    except Exception as e:
+                        messagebox.showerror("Ошибка отладки", f"Не удалось выполнить отладку: {str(e)}")
+                else:
+                    messagebox.showerror("Ошибка", "Нужно минимум 3 точки")
             self.canvas.draw()
         except ValueError as e:
             messagebox.showerror("Ошибка", f"Пожалуйста, введите корректные числа: {str(e)}")

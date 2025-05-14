@@ -2,6 +2,7 @@ import math
 import heapq
 import itertools
 import numpy as np
+import asyncio
 from matplotlib.patches import Rectangle
 
 class Point:
@@ -79,10 +80,11 @@ class VoronoiDelaunay:
         self.arc = None  # binary tree for parabola arcs
         self.points = PriorityQueue()  # site events
         self.event = PriorityQueue()  # circle events
-        self.x0 = -50.0
-        self.x1 = -50.0
-        self.y0 = 550.0
-        self.y1 = 550.0
+        self.x0 = 0.0
+        self.x1 = 100.0
+        self.y0 = 0.0
+        self.y1 = 100.0
+        self.delaunay_edges = []  # edges for Delaunay
 
     def setup_plot(self, ax, cell_size):
         ax.clear()
@@ -99,47 +101,98 @@ class VoronoiDelaunay:
                 rect = Rectangle((x, y), cell_size, cell_size, fill=False, edgecolor="gray")
                 ax.add_patch(rect)
 
-    def process_voronoi(self, points):
+    def clip_segment(self, segment):
+        """Обрезает сегмент до области [0, 100] x [0, 100]."""
+        if segment.end is None:
+            return None
+        p1, p2 = (segment.start.x, segment.start.y), (segment.end.x, segment.end.y)
+        def clip_line(x0, y0, x1, y1):
+            def compute_code(x, y):
+                code = 0
+                if x < 0: code |= 1
+                elif x > 100: code |= 2
+                if y < 0: code |= 4
+                elif y > 100: code |= 8
+                return code
+            code1 = compute_code(x0, y0)
+            code2 = compute_code(x1, y1)
+            while True:
+                if not (code1 | code2):
+                    return (x0, y0), (x1, y1)
+                if code1 & code2:
+                    return None
+                code_out = code1 if code1 else code2
+                if code_out & 8:
+                    x = x0 + (x1 - x0) * (100 - y0) / (y1 - y0)
+                    y = 100
+                elif code_out & 4:
+                    x = x0 + (x1 - x0) * (0 - y0) / (y1 - y0)
+                    y = 0
+                elif code_out & 2:
+                    y = y0 + (y1 - y0) * (100 - x0) / (x1 - x0)
+                    x = 100
+                elif code_out & 1:
+                    y = y0 + (y1 - y0) * (0 - x0) / (x1 - x0)
+                    x = 0
+                if code_out == code1:
+                    x0, y0, code1 = x, y, compute_code(x, y)
+                else:
+                    x1, y1, code2 = x, y, compute_code(x, y)
+        clipped = clip_line(p1[0], p1[1], p2[0], p2[1])
+        if clipped:
+            (x0, y0), (x1, y1) = clipped
+            segment.start = Point(x0, y0)
+            segment.end = Point(x1, y1)
+            return segment
+        return None
+
+    async def process_voronoi(self, points, ax, debug=False):
         self.output = []
         self.arc = None
         self.points = PriorityQueue()
         self.event = PriorityQueue()
-        self.x0 = -50.0
-        self.x1 = -50.0
-        self.y0 = 550.0
-        self.y1 = 550.0
+        self.x0 = 0.0
+        self.x1 = 100.0
+        self.y0 = 0.0
+        self.y1 = 100.0
 
         for pts in points:
             point = Point(pts[0], pts[1])
             self.points.push(point)
-            if point.x < self.x0: self.x0 = point.x
-            if point.y < self.y0: self.y0 = point.y
-            if point.x > self.x1: self.x1 = point.x
-            if point.y > self.y1: self.y1 = point.y
-
-        dx = (self.x1 - self.x0 + 1) / 5.0
-        dy = (self.y1 - self.y0 + 1) / 5.0
-        self.x0 -= dx
-        self.x1 += dx
-        self.y0 -= dy
-        self.y1 += dy
+            if debug:
+                self.setup_plot(ax, 10)
+                ax.plot(point.x, point.y, 'o', color='black', markersize=3)
+                ax.figure.canvas.draw()
+                ax.figure.canvas.flush_events()
+                await asyncio.sleep(0.4)
 
         while not self.points.empty():
             if not self.event.empty() and (self.event.top().x <= self.points.top().x):
-                self.process_event()
+                await self.process_event(ax, debug)
             else:
-                self.process_point()
+                await self.process_point(ax, debug)
 
         while not self.event.empty():
-            self.process_event()
+            await self.process_event(ax, debug)
 
-        self.finish_edges()
+        await self.finish_edges(ax, debug)
 
-    def process_point(self):
+    async def process_point(self, ax, debug=False):
         p = self.points.pop()
-        self.arc_insert(p)
+        await self.arc_insert(p, ax, debug)
+        if debug:
+            self.setup_plot(ax, 10)
+            for pt in self.points.entry_finder:
+                ax.plot(pt.x, pt.y, 'o', color='black', markersize=3)
+            ax.plot(p.x, p.y, 'o', color='red', markersize=5)
+            for segment in self.output:
+                if segment.end is not None:
+                    ax.plot([segment.start.x, segment.end.x], [segment.start.y, segment.end.y], color='blue')
+            ax.figure.canvas.draw()
+            ax.figure.canvas.flush_events()
+            await asyncio.sleep(0.4)
 
-    def process_event(self):
+    async def process_event(self, ax, debug=False):
         e = self.event.pop()
         if e.valid:
             s = Segment(e.p)
@@ -155,8 +208,19 @@ class VoronoiDelaunay:
             if a.s1 is not None: a.s1.finish(e.p)
             if a.pprev is not None: self.check_circle_event(a.pprev, e.x)
             if a.pnext is not None: self.check_circle_event(a.pnext, e.x)
+            if debug:
+                self.setup_plot(ax, 10)
+                for pt in self.points.entry_finder:
+                    ax.plot(pt.x, pt.y, 'o', color='black', markersize=3)
+                for segment in self.output:
+                    if segment.end is not None:
+                        ax.plot([segment.start.x, segment.end.x], [segment.start.y, segment.end.y], color='blue')
+                ax.plot(e.p.x, e.p.y, 'o', color='yellow', markersize=5)
+                ax.figure.canvas.draw()
+                ax.figure.canvas.flush_events()
+                await asyncio.sleep(0.4)
 
-    def arc_insert(self, p):
+    async def arc_insert(self, p, ax, debug=False):
         if self.arc is None:
             self.arc = Arc(p)
         else:
@@ -183,6 +247,17 @@ class VoronoiDelaunay:
                     self.check_circle_event(i, p.x)
                     self.check_circle_event(i.pprev, p.x)
                     self.check_circle_event(i.pnext, p.x)
+                    if debug:
+                        self.setup_plot(ax, 10)
+                        for pt in self.points.entry_finder:
+                            ax.plot(pt.x, pt.y, 'o', color='black', markersize=3)
+                        for segment in self.output:
+                            if segment.end is not None:
+                                ax.plot([segment.start.x, segment.end.x], [segment.start.y, segment.end.y], color='blue')
+                        ax.plot(z.x, z.y, 'o', color='green', markersize=5)
+                        ax.figure.canvas.draw()
+                        ax.figure.canvas.flush_events()
+                        await asyncio.sleep(0.4)
                     return
                 i = i.pnext
             i = self.arc
@@ -195,14 +270,24 @@ class VoronoiDelaunay:
             seg = Segment(start)
             i.s1 = i.pnext.s0 = seg
             self.output.append(seg)
+            if debug:
+                self.setup_plot(ax, 10)
+                for pt in self.points.entry_finder:
+                    ax.plot(pt.x, pt.y, 'o', color='black', markersize=3)
+                for segment in self.output:
+                    if segment.end is not None:
+                        ax.plot([segment.start.x, segment.end.x], [segment.start.y, segment.end.y], color='blue')
+                ax.figure.canvas.draw()
+                ax.figure.canvas.flush_events()
+                await asyncio.sleep(0.4)
 
     def check_circle_event(self, i, x0):
-        if (i.e is not None) and (i.e.x != self.x0):
+        if (i.e is not None) and (i.e.x != x0):
             i.e.valid = False
         i.e = None
         if (i.pprev is None) or (i.pnext is None): return
         flag, x, o = self.circle(i.pprev.p, i.p, i.pnext.p)
-        if flag and (x > self.x0):
+        if flag and (x > x0):
             i.e = Event(x, o, i)
             self.event.push(i.e)
 
@@ -215,7 +300,7 @@ class VoronoiDelaunay:
         E = A * (a.x + b.x) + B * (a.y + b.y)
         F = C * (a.x + c.x) + D * (a.y + c.y)
         G = 2 * (A * (c.y - b.y) - B * (c.x - b.x))
-        if G == 0: return False, None, None
+        if abs(G) < 1e-10: return False, None, None
         ox = (D * E - B * F) / G
         oy = (A * F - C * E) / G
         x = ox + math.sqrt((a.x - ox) ** 2 + (a.y - oy) ** 2)
@@ -224,7 +309,7 @@ class VoronoiDelaunay:
 
     def intersect(self, p, i):
         if i is None: return False, None
-        if i.p.x == p.x: return False, None
+        if abs(i.p.x - p.x) < 1e-10: return False, None
         a = b = 0.0
         if i.pprev is not None:
             a = self.intersection(i.pprev.p, i.p, p.x).y
@@ -238,11 +323,11 @@ class VoronoiDelaunay:
 
     def intersection(self, p0, p1, l):
         p = p0
-        if p0.x == p1.x:
+        if abs(p0.x - p1.x) < 1e-10:
             py = (p0.y + p1.y) / 2.0
-        elif p1.x == l:
+        elif abs(p1.x - l) < 1e-10:
             py = p1.y
-        elif p0.x == l:
+        elif abs(p0.x - l) < 1e-10:
             py = p0.y
             p = p1
         else:
@@ -251,20 +336,31 @@ class VoronoiDelaunay:
             a = 1.0 / z0 - 1.0 / z1
             b = -2.0 * (p0.y / z0 - p1.y / z1)
             c = (p0.y ** 2 + p0.x ** 2 - l ** 2) / z0 - (p1.y ** 2 + p1.x ** 2 - l ** 2) / z1
+            if abs(a) < 1e-10: return Point((p0.x + p1.x) / 2, (p0.y + p1.y) / 2)
             py = (-b - math.sqrt(b * b - 4 * a * c)) / (2 * a)
         px = (p.x ** 2 + (p.y - py) ** 2 - l ** 2) / (2 * p.x - 2 * l)
         return Point(px, py)
 
-    def finish_edges(self):
-        l = self.x1 + (self.x1 - self.x0) + (self.y1 - self.y0)
+    async def finish_edges(self, ax, debug=False):
+        l = self.x1 + 10.0
         i = self.arc
         while i.pnext is not None:
             if i.s1 is not None:
-                p = self.intersection(i.p, i.pnext.p, l * 2.0)
+                p = self.intersection(i.p, i.pnext.p, l)
                 i.s1.finish(p)
+                if debug:
+                    self.setup_plot(ax, 10)
+                    for pt in self.points.entry_finder:
+                        ax.plot(pt.x, pt.y, 'o', color='black', markersize=3)
+                    for segment in self.output:
+                        if segment.end is not None:
+                            ax.plot([segment.start.x, segment.end.x], [segment.start.y, segment.end.y], color='blue')
+                    ax.figure.canvas.draw()
+                    ax.figure.canvas.flush_events()
+                    await asyncio.sleep(0.4)
             i = i.pnext
 
-    def process_delaunay(self, points):
+    async def process_delaunay(self, points, ax, debug=False):
         def in_circle(p, a, b, c):
             ax, ay = a[0] - p[0], a[1] - p[1]
             bx, by = b[0] - p[0], b[1] - p[1]
@@ -292,11 +388,30 @@ class VoronoiDelaunay:
         supertri = find_supertriangle(points)
         triangles = [supertri]
         temp_points = points + supertri
+        if debug:
+            self.setup_plot(ax, 10)
+            for x, y in temp_points:
+                ax.plot(x, y, 'o', color='black', markersize=3)
+            for t in triangles:
+                ax.plot([t[0][0], t[1][0], t[2][0], t[0][0]], [t[0][1], t[1][1], t[2][1], t[0][1]], color='blue')
+            ax.figure.canvas.draw()
+            ax.figure.canvas.flush_events()
+            await asyncio.sleep(0.4)
         for p in points:
             bad_triangles = []
             for t in triangles:
                 if in_circle(p, t[0], t[1], t[2]):
                     bad_triangles.append(t)
+            if debug:
+                self.setup_plot(ax, 10)
+                for x, y in temp_points:
+                    ax.plot(x, y, 'o', color='black', markersize=3)
+                for t in bad_triangles:
+                    ax.plot([t[0][0], t[1][0], t[2][0], t[0][0]], [t[0][1], t[1][1], t[2][1], t[0][1]], color='red')
+                ax.plot(p[0], p[1], 'o', color='yellow', markersize=5)
+                ax.figure.canvas.draw()
+                ax.figure.canvas.flush_events()
+                await asyncio.sleep(0.4)
             polygon = []
             for t in bad_triangles:
                 for i in range(3):
@@ -311,24 +426,36 @@ class VoronoiDelaunay:
             triangles = [t for t in triangles if t not in bad_triangles]
             for edge in polygon:
                 triangles.append([edge[0], edge[1], p])
+            if debug:
+                self.setup_plot(ax, 10)
+                for x, y in temp_points:
+                    ax.plot(x, y, 'o', color='black', markersize=3)
+                for t in triangles:
+                    ax.plot([t[0][0], t[1][0], t[2][0], t[0][0]], [t[0][1], t[1][1], t[2][1], t[0][1]], color='blue')
+                ax.plot(p[0], p[1], 'o', color='green', markersize=5)
+                ax.figure.canvas.draw()
+                ax.figure.canvas.flush_events()
+                await asyncio.sleep(0.4)
         triangles = [t for t in triangles if not any(p in supertri for p in t)]
         edges = set()
         for t in triangles:
             edges.add(tuple(sorted([t[0], t[1]])))
             edges.add(tuple(sorted([t[1], t[2]])))
             edges.add(tuple(sorted([t[2], t[0]])))
-        return list(edges)
+        self.delaunay_edges = list(edges)
+        return self.delaunay_edges
 
-    def draw(self, points, cell_size, ax, mode="delaunay"):
+    async def draw(self, points, cell_size, ax, mode="delaunay", debug=False):
         self.setup_plot(ax, cell_size)
         for x, y in points:
             ax.plot(x, y, 'o', color='black', markersize=3)
         if mode == "voronoi":
-            self.process_voronoi(points)
+            await self.process_voronoi(points, ax, debug)
             for segment in self.output:
-                if segment.end is not None:
+                clipped = self.clip_segment(segment)
+                if clipped and segment.end is not None:
                     ax.plot([segment.start.x, segment.end.x], [segment.start.y, segment.end.y], color='blue')
         elif mode == "delaunay":
-            edges = self.process_delaunay(points)
+            edges = await self.process_delaunay(points, ax, debug)
             for p1, p2 in edges:
                 ax.plot([p1[0], p2[0]], [p1[1], p2[1]], color='blue')
